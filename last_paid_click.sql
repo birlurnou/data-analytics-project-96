@@ -42,7 +42,7 @@ from last_paid_click as lpc
 left join leads as l
     on lpc.visitor_id = l.visitor_id
     -- проверка, что лид создан во время или после визита, иначе null
-    and (lpc.visit_date <= l.created_at or l.created_at is null)
+    and (lpc.visit_date <= l.created_at)
 order by
     l.amount desc nulls last,
     lpc.visit_date asc,
