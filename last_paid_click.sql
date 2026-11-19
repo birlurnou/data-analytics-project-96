@@ -18,7 +18,8 @@ lead_last_click as (
         l.created_at,
         pc.visit_date as click_date,
         row_number() over (
-            partition by l.lead_id
+-- изменил партицию
+            partition by pc.visitor_id
             order by pc.visit_date desc
         ) as rn
     from leads as l

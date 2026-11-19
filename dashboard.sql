@@ -1,134 +1,95 @@
 -- все запросы построены на основе главной витрины aggregate_last_paid_click
 -- по данным витрины создавались чарты и формировался дашборд
-
+-- ! перестроены под модель last_paid_click !
 
 -- 1 создаем представление aggregate_last_paid_click
 create view aggregate_last_paid_click as
 
--- расходы по каналам из vk_ads и ya_ads
-with spent as (
+-- находим последнюю сессию каждого посетителя и привязываем к ней лид, если он был создан после этой сессии
+with last_paid_click as (
     select
-        date_trunc('day', campaign_date)::date as visit_date,
-        utm_source,
-        utm_medium,
-        utm_campaign,
-        sum(daily_spent) as total_cost
-    from (
-        select campaign_date, utm_source, utm_medium, utm_campaign, daily_spent
-        from vk_ads
-        union all
-        select campaign_date, utm_source, utm_medium, utm_campaign, daily_spent
-        from ya_ads
-    ) ads
-    group by 1, 2, 3, 4
-),
-
--- только платные визиты
-paid_clicks as (
-    select
-        visitor_id,
-        visit_date,
-        source as utm_source,
-        medium as utm_medium,
-        campaign as utm_campaign
-    from sessions
-    where medium in ('cpc','cpm','cpa','youtube','cpp','tg','social')
-),
-
--- все платные клики до каждого из лидов
-lead_clicks as (
-    select
+        s.visitor_id,
+        s.visit_date,
+        s.source as utm_source,
+        s.medium as utm_medium,
+        s.campaign as utm_campaign,
         l.lead_id,
-        l.visitor_id,
         l.created_at,
         l.amount,
+        l.closing_reason,
         l.status_id,
-        pc.visit_date,
-        pc.utm_source,
-        pc.utm_medium,
-        pc.utm_campaign,
+        -- нумеруем сессии
         row_number() over (
-            partition by l.lead_id
-            order by pc.visit_date desc
+            partition by s.visitor_id
+            order by s.visit_date desc
         ) as rn
-    from leads l
-    join paid_clicks pc
-        on pc.visitor_id = l.visitor_id
-       and pc.visit_date <= l.created_at
+    from sessions as s
+    left join leads as l
+        on s.visitor_id = l.visitor_id
+       and s.visit_date <= l.created_at
+    where s.medium != 'organic'
 ),
 
--- последние клики перед конвертацией в лида
-last_paid_click as (
+-- оставляем только последнюю сессию каждого посетителя и группируем
+lpc as (
     select
-        lead_id,
-        visitor_id,
-        visit_date,
+        visit_date::date as visit_date,
         utm_source,
         utm_medium,
         utm_campaign,
-        amount,
-        status_id
-    from lead_clicks
-    where rn = 1
-),
-
--- агрегаты по лидам для leads_count, purchases_count, revenue
-leads_agg as (
-    select
-        visit_date::date,
-        utm_source,
-        utm_medium,
-        utm_campaign,
+        count(visitor_id) as visitors_count,
         count(lead_id) as leads_count,
-        count(case when status_id = 142 then lead_id end) as purchases_count,
-        sum(case when status_id = 142 then amount end) as revenue
+        count(case when status_id = 142 then 1 end) as purchases_count,
+        sum(amount) as revenue
     from last_paid_click
+    where rn = 1
     group by 1, 2, 3, 4
 ),
 
--- агрегаты по визитам для visitors_count перед джойном с лидами
-visitors_agg as (
+-- собираем расходы по рекламным кампаниям и группируем
+ads as (
     select
-        visit_date::date,
+        campaign_date::date as visit_date,
         utm_source,
         utm_medium,
         utm_campaign,
-        count(distinct visitor_id) as visitors_count
-    from paid_clicks
-    group by 1, 2, 3, 4
+        sum(daily_spent) as daily_spent
+    from ya_ads group by 1, 2, 3, 4
+    union all
+    select
+        campaign_date::date as visit_date,
+        utm_source,
+        utm_medium,
+        utm_campaign,
+        sum(daily_spent) as daily_spent
+    from vk_ads group by 1, 2, 3, 4
 )
 
--- строим финальную витрину по полям visit_date, utm_source, utm_medium, utm_campaign
+-- джойним метрики last click с расходами по дате и меткам и оставляем только те строки, где utm_source is not null
 select
-    s.total_cost,
-    coalesce(v.visit_date, l.visit_date, s.visit_date) as visit_date,
-    coalesce(v.visitors_count, 0) as visitors_count,
-    coalesce(v.utm_source, l.utm_source, s.utm_source) as utm_source,
-    coalesce(v.utm_medium, l.utm_medium, s.utm_medium) as utm_medium,
-    coalesce(v.utm_campaign, l.utm_campaign, s.utm_campaign) as utm_campaign,
-    coalesce(l.leads_count, 0) as leads_count,
-    coalesce(l.purchases_count, 0) as purchases_count,
-    coalesce(l.revenue, 0) as revenue
-from visitors_agg as v
-full join leads_agg as l
-    on
-        v.visit_date = l.visit_date
-        and v.utm_source = l.utm_source
-        and v.utm_medium = l.utm_medium
-        and v.utm_campaign = l.utm_campaign
-full join spent as s
-    on
-        coalesce(v.visit_date, l.visit_date) = s.visit_date
-        and coalesce(v.utm_source, l.utm_source) = s.utm_source
-        and coalesce(v.utm_medium, l.utm_medium) = s.utm_medium
-        and coalesce(v.utm_campaign, l.utm_campaign) = s.utm_campaign;
--- order by
---     revenue desc nulls last,
---     visit_date asc,
---     visitors_count desc,
---     utm_source asc,
---     utm_medium asc,
---     utm_campaign asc;
+    lpc.visit_date,
+    lpc.visitors_count,
+    lpc.utm_source,
+    lpc.utm_medium,
+    lpc.utm_campaign,
+    ads.daily_spent as total_cost,
+    lpc.leads_count,
+    lpc.purchases_count,
+    lpc.revenue
+from lpc
+left join ads
+    on ads.visit_date = lpc.visit_date
+   and ads.utm_source = lpc.utm_source
+   and ads.utm_medium = lpc.utm_medium
+   and ads.utm_campaign = lpc.utm_campaign
+where ads.utm_source is not null
+order by
+    revenue desc nulls last,
+    visit_date asc,
+    visitors_count desc,
+    utm_source asc,
+    utm_medium asc,
+    utm_campaign asc;
 
 
 
